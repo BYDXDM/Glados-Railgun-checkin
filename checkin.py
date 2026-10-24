@@ -436,8 +436,8 @@ class API:
             return "None 积分", 0
 
     @log_method
-    def exchange(self, cookies: str, plan: str, required_points: int) -> str:
-        """执行兑换"""
+    def exchange(self, cookies: str, plan: str) -> str:
+        """执行兑换（积分门槛由调用方校验）"""
         url = self._get_full_url(self.EXCHANGE_URL)
         response = self._make_request(url, "POST", {"planType": plan}, cookies)
 
@@ -640,13 +640,30 @@ class Checker:
 
             if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
                 required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
-                self._log(
-                    cookie_idx,
-                    domain,
-                    LogEmoji.EXCHANGE,
-                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-                )
-                result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+                if points_str == "None 积分":
+                    result.exchange = "积分查询失败，跳过自动兑换"
+                    self._log(cookie_idx, domain, LogEmoji.WARNING, result.exchange)
+                elif points_num >= required_points:
+                    self._log(
+                        cookie_idx,
+                        domain,
+                        LogEmoji.EXCHANGE,
+                        f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
+                    )
+                    result.exchange = api.exchange(cookie, self.config.exchange_plan)
+                    if result.exchange.startswith("兑换成功"):
+                        # 兑换后刷新剩余天数与积分，推送展示兑换后的最新值
+                        self._log(cookie_idx, domain, LogEmoji.STATUS, "兑换成功，刷新剩余天数")
+                        days_str, _ = api.get_status(cookie)
+                        if days_str != "None 天":
+                            result.days = days_str
+                        self._log(cookie_idx, domain, LogEmoji.POINTS, "刷新兑换后总积分")
+                        points_str, _ = api.get_points(cookie)
+                        if points_str != "None 积分":
+                            result.points_total = points_str
+                else:
+                    result.exchange = f"积分不足 (当前 {points_num}/{required_points})，跳过自动兑换"
+                    self._log(cookie_idx, domain, LogEmoji.INFO, result.exchange)
             else:
                 result.exchange = "未配置兑换计划，跳过自动兑换"
                 self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换")
