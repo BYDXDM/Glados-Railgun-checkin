@@ -8,8 +8,8 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    - cron: '18 9,12 * * *'
-      timezone: 'Asia/Shanghai'
+    # GitHub Actions cron 仅支持 UTC，不支持 timezone 字段
+    - cron: '18 0,4 * * *'  # UTC 0:18/4:18 = 北京时间 8:18/12:18
 
 jobs:
   build:
