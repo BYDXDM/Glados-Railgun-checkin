@@ -38,7 +38,12 @@
 - 在 GLaDOS 签到页面按 `F12`，切换到 `Network` 页面下，刷新
 - 点击第一个请求，在 `Request Headers` 下找到 `Cookie`，右键复制其值即可
 
-  > 参考格式：`koa:sess=eyJ1c2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxAwMH0=; koa:sess.sig=xJkOxxxxxxxxxxxxxxxtnM;`
+  > 参考格式（glados.cloud）：`gld:accts=gld_fde8xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; gld:accts.sig=rfxuyt3bxxxxxxxxxxxxxxxxxxxx; gld:sess=gld_fde8xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; gld:sess.sig=cg52KdMLfKP30KbVDlxGeBHouLk`
+  >
+  > 参考格式（railgun.info）：`koa:sess=eyJ1c2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxAwMH0=; koa:sess.sig=xJkOxxxxxxxxxxxxxxxtnM`
+
+  > **注意**：2026 年起 glados.cloud 改用 `gld:` 前缀的 Cookie，旧的 `koa:` 已失效（服务端返回 `code=-2 没有权限`）。
+  > 两个站点是独立的账号体系，各自只有自己站点的 Cookie 有效；脚本会按 Cookie 内的键名自动只对该站点签到。
 
 - 多账号请在 `COOKIES` 中添加多个 cookies，中间使用 `&` 连接即可（例如：`c1&c2&c3`）
 
@@ -73,7 +78,7 @@
 - **2026-01**: 重构代码，添加日志输出方便定位，支持新版网址，支持配置积分兑换策略。
 - **2026-04**: 优化代码逻辑与日志输出，支持[新版域名](https://railgun.info)，在 `GLADOS_COOKIES` 中添加新版域名下的 cookies 即可使用。
 - **2026-09**: 设备平台自适应重试（无需手动配置 UA 即可自动恢复签到）；网络层自动重试与退避，降低 CI 网络抖动导致的误报失败；日志时间统一为北京时间，定时任务调整为北京时间每天 2 次并避开整点高峰；默认关闭自动兑换，需显式配置后才启用。
-- **2026-10**: 日志级别短标签 `[I]/[W]/[E]` ；推送兼容 Server酱（策略模式多后端「都发」），新增 `requirements.txt` ；自动兑换前校验积分余额，达标才兑换（积分不足时跳过并在推送中提示），兑换成功后自动刷新剩余天数与总积分；修复定时任务时区写法（GitHub cron 仅支持 UTC），调整为北京时间 8:18 / 12:18 各一次。
+- **2026-10**: 按 Cookie 键名自动识别所属站点（`gld:*` → glados.cloud、`koa:*` → railgun.info），不再拿一个站点的 Cookie 去撞另一个站点；全部签到任务失败时以非零退出码结束，Actions 会如实报红，避免长期失败却始终显示绿色；日志级别短标签 `[I]/[W]/[E]` ；推送兼容 Server酱（策略模式多后端「都发」），新增 `requirements.txt` ；自动兑换前校验积分余额，达标才兑换（积分不足时跳过并在推送中提示），兑换成功后自动刷新剩余天数与总积分；修复定时任务时区写法（GitHub cron 仅支持 UTC），调整为北京时间 8:18 / 12:18 各一次。
 
 ## 问题排查与定位
 

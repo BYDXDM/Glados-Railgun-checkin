@@ -112,6 +112,12 @@ class Config:
     """默认域名"""
     DOMAINS = ["glados.cloud", "railgun.info"]
 
+    """Cookie 键名 → 所属站点：gld:* 是 glados.cloud 的会话，koa:* 是 railgun.info 的会话"""
+    DOMAIN_COOKIE_KEYS = {
+        "glados.cloud": ("gld:sess", "gld:accts"),
+        "railgun.info": ("koa:sess",),
+    }
+
     """兑换计划列表"""
     EXCHANGE_PLANS = {
         ExchangePlan.PLAN100.value: 100,
@@ -126,6 +132,15 @@ class Config:
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
+
+    @classmethod
+    def detect_domains(cls, cookie: str) -> List[str]:
+        """按 Cookie 内的键名推断所属站点，识别不出时回退到全部域名。
+        gld:* 是新版会话，优先于遗留的 koa:*，因此同时存在时按 glados.cloud 处理。"""
+        for domain in cls.DOMAINS:
+            if any(key in cookie for key in cls.DOMAIN_COOKIE_KEYS.get(domain, ())):
+                return [domain]
+        return list(cls.DOMAINS)
 
     def _load_config(self) -> None:
         """加载配置"""
@@ -597,16 +612,17 @@ class Checker:
     def checkin_all(self):
         """执行所有签到任务"""
         cookie_count = len(self.config.cookies_list)
-        domain_count = len(self.config.DOMAINS)
-        total_tasks = cookie_count * domain_count
+        # 每个 Cookie 只对它自己站点的域名签到，避免拿 glados 的 Cookie 去撞 railgun
+        tasks = [(cookie, Config.detect_domains(cookie)) for cookie in self.config.cookies_list]
+        total_tasks = sum(len(domains) for _, domains in tasks)
         task_idx = 0
 
-        logger.info(f"{LogEmoji.INFO} 共 {cookie_count} 个 Cookie, {domain_count} 个域名, 共 {total_tasks} 个任务")
+        logger.info(f"{LogEmoji.INFO} 共 {cookie_count} 个 Cookie, 共 {total_tasks} 个任务")
 
-        for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
+        for cookie_idx, (cookie, domains) in enumerate(tasks, 1):
             logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
 
-            for domain in self.config.DOMAINS:
+            for domain in domains:
                 task_idx += 1
                 logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
 
@@ -724,6 +740,7 @@ def main():
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             payload = {"title": "# 未找到 cookies!", "rows": []}
+            exit_code = 1
         else:
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
@@ -732,6 +749,11 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             payload = checker.format_results()
             logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{payload['title']}\n{render_payload(payload)}")
+
+            # 全部失败才判红：只要有一个站点签到成功或重复签到，就不算整体失败
+            if payload["fail"] and not (payload["success"] or payload["repeat"]):
+                logger.error(f"{LogEmoji.ERROR} 全部签到任务失败，以非零退出码结束，便于 Actions 报红。")
+                exit_code = 1
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
