@@ -8,8 +8,11 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    # GitHub Actions cron 仅支持 UTC，不支持 timezone 字段
-    - cron: '18 0,4 * * *'  # UTC 0:18/4:18 = 北京时间 8:18/12:18
+    # GitHub Actions cron 仅支持 UTC，不支持 timezone 字段。
+    # 实测 GitHub 的 schedule 排队延迟极大（本项目历史运行落在 UTC 04:55~09:12，
+    # 即北京时间 12:55~17:12，且每天只实际触发 1 次），早班档位经常整体不触发。
+    # 签到本身幂等（当天重复只返回 code=1 重复签到，不重复加分），因此多排几档提高命中率。
+    - cron: '18 0,1,2,4 * * *'  # UTC 0:18/1:18/2:18/4:18 = 北京时间 8:18/9:18/10:18/12:18
 
 jobs:
   build:
