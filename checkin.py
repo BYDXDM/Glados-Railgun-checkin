@@ -1,6 +1,7 @@
 import os
 import sys
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -94,6 +95,11 @@ def log_method(func):
     return wrapper
 
 
+def beijing_today() -> str:
+    """当前北京时间日期（兑换按自然日幂等，与日志时区一致）"""
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
 class Config:
     """应用配置"""
 
@@ -102,6 +108,7 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_STATE_DIR = "GLADOS_STATE_DIR"
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -131,6 +138,10 @@ class Config:
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
+        # “当日已兑换”标记目录；workflow 中经 actions/cache 跨运行持久化，本地默认写入用户目录
+        self.state_dir: str = os.environ.get(self.ENV_STATE_DIR) or os.path.join(
+            os.path.expanduser("~"), ".glados-checkin-state"
+        )
         self._load_config()
 
     @classmethod
@@ -602,6 +613,29 @@ class Checker:
     def __init__(self, config: Config):
         self.config = config
         self.results = []
+        # 本运行是否发生过兑换（供 workflow 判断是否持久化当日兑换状态）
+        self.exchanged = False
+
+    def _exchange_marker_path(self, cookie_idx: int, domain: str) -> str:
+        """当日已兑换标记文件路径（按 Cookie+站点区分，多账户互不影响）"""
+        return os.path.join(self.config.state_dir, f"exchanged-{cookie_idx}-{domain}.txt")
+
+    def _exchanged_today(self, cookie_idx: int, domain: str) -> bool:
+        """检查当日已兑换标记（幂等守卫：防止一天多次不可逆兑换）"""
+        try:
+            with open(self._exchange_marker_path(cookie_idx, domain), "r", encoding="utf-8") as f:
+                return f.read().strip() == beijing_today()
+        except OSError:
+            return False
+
+    def _mark_exchanged_today(self, cookie_idx: int, domain: str) -> None:
+        """写入当日已兑换标记；失败仅告警，不影响签到主流程"""
+        try:
+            os.makedirs(self.config.state_dir, exist_ok=True)
+            with open(self._exchange_marker_path(cookie_idx, domain), "w", encoding="utf-8") as f:
+                f.write(beijing_today())
+        except OSError as e:
+            logger.warning(f"{LogEmoji.WARNING} 写入当日已兑换标记失败: {e}")
 
     def _log(self, cookie_idx: int, domain: str, emoji: str, message: str, force: bool = False) -> None:
         """统一日志输出方法"""
@@ -649,6 +683,9 @@ class Checker:
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            if checkin_result.get("code") == CheckinStatus.SUCCESS:
+                # 本次获得的积分只在签到成功时返回，重复/失败均为 0
+                result.points = str(checkin_result.get("points", "0"))
 
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
@@ -659,6 +696,9 @@ class Checker:
                 if points_str == "None 积分":
                     result.exchange = "积分查询失败，跳过自动兑换"
                     self._log(cookie_idx, domain, LogEmoji.WARNING, result.exchange)
+                elif self._exchanged_today(cookie_idx, domain):
+                    result.exchange = "今日已兑换，跳过自动兑换"
+                    self._log(cookie_idx, domain, LogEmoji.INFO, result.exchange)
                 elif points_num >= required_points:
                     self._log(
                         cookie_idx,
@@ -668,6 +708,9 @@ class Checker:
                     )
                     result.exchange = api.exchange(cookie, self.config.exchange_plan)
                     if result.exchange.startswith("兑换成功"):
+                        # 当日已兑换标记先落盘，再刷新展示值
+                        self._mark_exchanged_today(cookie_idx, domain)
+                        self.exchanged = True
                         # 兑换后刷新剩余天数与积分，推送展示兑换后的最新值
                         self._log(cookie_idx, domain, LogEmoji.STATUS, "兑换成功，刷新剩余天数")
                         days_str, _ = api.get_status(cookie)
@@ -745,6 +788,11 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
             checker.checkin_all()
+            # 供 workflow 的 actions/cache/save 判断是否需要持久化当日兑换状态（本地无 GITHUB_OUTPUT 时忽略）
+            gh_output = os.environ.get("GITHUB_OUTPUT")
+            if gh_output and checker.exchanged:
+                with open(gh_output, "a", encoding="utf-8") as f:
+                    f.write("exchanged=true\n")
 
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             payload = checker.format_results()

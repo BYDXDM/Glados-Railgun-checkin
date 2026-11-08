@@ -14,11 +14,18 @@ on:
     # 签到本身幂等（当天重复只返回 code=1 重复签到，不重复加分），因此多排几档提高命中率。
     - cron: '18 0,1,2,4 * * *'  # UTC 0:18/1:18/2:18/4:18 = 北京时间 8:18/9:18/10:18/12:18
 
+# 同一 workflow 的多触发源（schedule/push/dispatch/keepalive 派发）互斥，防并发签到/兑换竞态。
+# cancel-in-progress 保持 false（排队串行）：兑换不可逆，取消在途运行可能恰好打断
+# “当日已兑换”标记落盘，排队让后续运行拿到最新标记后快速跳过兑换。
+concurrency:
+  group: checkin
+  cancel-in-progress: false
+
 jobs:
   build:
     name: glados/railgun checkin
     runs-on: ubuntu-latest
-      
+
     permissions:
       contents: read
       actions: write
@@ -32,6 +39,8 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
+    # checkout/setup-python 为 GitHub 官方 action，仍用可变 tag 引用；
+    # 按 SHA 固定需联网查询 commit，本次未实施，建议后续手动固化（见 CODE-REVIEW P1-2）
     - name: Checkout Code
       uses: actions/checkout@v6
 
@@ -39,6 +48,18 @@ jobs:
       uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
+
+    # 当日日期（runner 为 UTC；全部 cron 档位 UTC 0~5 点，与北京日期一致），
+    # 用作兑换状态缓存键，实现“当日已兑换”跨运行守卫
+    - name: Compute state date
+      run: echo "STATE_DATE=$(date +%Y%m%d)" >> "$GITHUB_ENV"
+
+    # 恢复当日“已兑换”标记（actions/cache 为官方 action，可变 tag，同上建议后续固化）
+    - name: Restore exchange state
+      uses: actions/cache/restore@v4
+      with:
+        key: glados-exchange-state-${{ env.STATE_DATE }}
+        path: state/
 
     # 安装 python 库
     - name: Install dependencies
@@ -48,6 +69,7 @@ jobs:
 
     # 执行 签到脚本
     - name: Running checkin
+      id: checkin
       run: |
         python checkin.py
       env:
@@ -56,15 +78,45 @@ jobs:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        GLADOS_STATE_DIR: state
 
-    - name: Keep alive
-      uses: liskin/gh-workflow-keepalive@v1 
-        
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@v2
+    # 仅当本运行发生过兑换才写入缓存：避免“未兑换”状态抢先占用当日缓存键，
+    # 导致后续真正兑换的运行无法持久化标记（缓存键一旦写入不可覆盖）
+    - name: Save exchange state
+      if: steps.checkin.outputs.exchanged == 'true'
+      uses: actions/cache/save@v4
       with:
-        token: ${{ github.token }}
-        repository: ${{ github.repository }}
-        retain_days: 7
-        keep_minimum_runs: 7
-        delete_run_by_conclusion_pattern: success
+        key: glados-exchange-state-${{ env.STATE_DATE }}
+        path: state/
+
+    # 原 liskin/gh-workflow-keepalive@v1（第三方，可变 tag）改为官方 API 内联实现：
+    # schedule 命中后经 workflow_dispatch 再触发一次本 workflow，刷新仓库“最近活跃”时间，
+    # 避免 GitHub 在 60 天无活动后自动停用定时任务（副作用：每次 schedule 实际命中会多跑一个签到 job）。
+    # 工作流文件改名时需同步这里的 gladosCheck.yml
+    - name: Keep alive
+      if: github.event_name == 'schedule'
+      run: |
+        gh workflow run gladosCheck.yml --ref "${GITHUB_REF_NAME}"
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    # 原 Mattraks/delete-workflow-runs@v2（第三方，可变 tag）改为官方 API 内联实现：
+    # 删除结局为 success 且早于 retain_days 的运行记录，但至少保留最近 keep_minimum_runs 次
+    - name: Delete workflow runs
+      run: |
+        retain_days=7
+        keep_minimum_runs=7
+        cutoff=$(date -u -d "${retain_days} days ago" +%Y-%m-%dT%H:%M:%SZ)
+        # 全部运行按新到旧排序后第 keep_minimum_runs 条的 created_at 作为保留边界（总数不足时为空串，则全保留）
+        boundary=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+          --jq '.workflow_runs[].created_at' | sort -r | sed -n "${keep_minimum_runs}p")
+        ids=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?conclusion=success&per_page=100" \
+          --jq ".workflow_runs[] | select(.created_at < \"${cutoff}\" and .created_at < \"${boundary}\") | .id")
+        count=0
+        for id in $ids; do
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" >/dev/null
+          count=$((count + 1))
+        done
+        echo "Deleted ${count} workflow run(s)"
+      env:
+        GH_TOKEN: ${{ github.token }}
