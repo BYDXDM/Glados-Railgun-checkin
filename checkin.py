@@ -1,3 +1,4 @@
+import http.cookiejar
 import os
 import sys
 from dataclasses import asdict, dataclass
@@ -208,6 +209,29 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
 
+class _BlockAllCookies(http.cookiejar.CookiePolicy):
+    """彻底禁用 Cookie Jar 的存取策略：请求 Cookie 一律走显式 cookie 头。
+
+    Session 默认会把响应 Set-Cookie（含风控/统计等异名 Cookie）收进 Jar 形成隐式状态；
+    现行 requests 对"Jar 头覆盖显式 cookie 头"有 has_header 守卫未复现（CODE-REVIEW P2-4），
+    但显式禁用后 Jar 恒空，Cookie 语义只由显式头决定，不随 requests 内部合并实现变化。"""
+
+    netscape = True
+    rfc2965 = hide_cookie2 = False
+
+    def set_ok(self, cookie, request):
+        return False
+
+    def return_ok(self, cookie, request):
+        return False
+
+    def domain_return_ok(self, cookie, request):
+        return False
+
+    def path_return_ok(self, cookie, request):
+        return False
+
+
 # 各平台合法 User-Agent（版本号无关，仅平台 token 关键）
 PLATFORM_UA = {
     "Windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -234,7 +258,8 @@ class API:
         self._device_ua_cache: Dict[str, str] = {}
         self.session = requests.Session()
         self.session.headers.update(self.headers)
-        # 网络抖动时自动重试（指数退避），避免误报失败
+        # 网络抖动时自动重试（指数退避），避免误报失败。
+        # 仅挂在通用 session 上：签到 POST 幂等（重复签到返回 code=1，不重复加分）可安全重试
         retry_strategy = Retry(
             total=3,
             backoff_factor=1.0,
@@ -245,6 +270,15 @@ class API:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        # 兑换专用 session：默认适配器 max_retries=0，POST 不自动重发——
+        # 服务端可能已完成扣分/加天数后网关才返回 5xx，自动重试会在一次运行内双发兑换，
+        # 且重发发生在 session.post 内部，“当日已兑换”守卫不可见（CODE-REVIEW P2-3）
+        self.exchange_session = requests.Session()
+        self.exchange_session.headers.update(self.headers)
+        # Cookie 全部走显式 cookie 头：禁用 Jar 存取，Jar 恒空，
+        # Cookie 语义不随 requests 的 Jar 合并行为变化（CODE-REVIEW P2-4）
+        self.session.cookies.set_policy(_BlockAllCookies())
+        self.exchange_session.cookies.set_policy(_BlockAllCookies())
 
     def __del__(self):
         """关闭 session"""
@@ -252,11 +286,13 @@ class API:
 
     def close(self) -> None:
         """关闭 session"""
-        if hasattr(self, "session"):
-            try:
-                self.session.close()
-            except Exception as e:
-                logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {e}")
+        for attr in ("session", "exchange_session"):
+            s = getattr(self, attr, None)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception as e:
+                    logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {e}")
 
     def __enter__(self):
         """进入上下文管理器"""
@@ -292,8 +328,10 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
-        """发送 HTTP 请求"""
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None, session: Optional[requests.Session] = None) -> Optional[requests.Response]:
+        """发送 HTTP 请求；session 非空时使用指定会话（兑换用无重试会话），否则用默认重试会话"""
+        if session is None:
+            session = self.session
         session_headers = self.headers.copy()
         if user_agent:
             session_headers["user-agent"] = user_agent
@@ -301,9 +339,9 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                response = session.post(url, headers=session_headers, data=data, timeout=(60, 120))
             elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                response = session.get(url, headers=session_headers, timeout=(60, 120))
             else:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
@@ -463,9 +501,9 @@ class API:
 
     @log_method
     def exchange(self, cookies: str, plan: str) -> str:
-        """执行兑换（积分门槛由调用方校验）"""
+        """执行兑换（积分门槛由调用方校验）；POST 不自动重试，防止非幂等请求双发"""
         url = self._get_full_url(self.EXCHANGE_URL)
-        response = self._make_request(url, "POST", {"planType": plan}, cookies)
+        response = self._make_request(url, "POST", {"planType": plan}, cookies, session=self.exchange_session)
 
         if response:
             data = response.json()

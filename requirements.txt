@@ -1,4 +1,6 @@
-# GLaDOS 自动签到依赖
-requests
-pypushdeer
-serverchan-sdk
+# GLaDOS 自动签到依赖（版本范围固定，保证构建可复现，避免每日 CI 无条件吞入破坏性更新）
+# urllib3 需 >=1.26：代码使用 Retry(allowed_methods=...)，该参数名仅 1.26+ 存在
+requests>=2.31,<3
+urllib3>=1.26,<3
+pypushdeer>=0.0.3,<0.1
+serverchan-sdk>=1.0,<2
